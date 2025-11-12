@@ -1,0 +1,6 @@
+# Model checkpoints
+*.pth
+
+# Virtual environment
+venv/
+.venv/
