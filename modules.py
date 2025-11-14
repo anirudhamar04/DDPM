@@ -155,5 +155,94 @@ class UNet(nn.Module):
         return output
 
 
+# Add this to modules.py after the existing UNet class
 
+class UNetNCSN(nn.Module):
+    """
+    UNet for Noise Conditional Score Networks (NCSN).
+    Uses sigma (noise level) conditioning instead of timestep.
+    """
+    def __init__(self, c_in=3, c_out=3, sigma_dim=256, device="cuda"):
+        super(UNetNCSN, self).__init__()
+        self.device = device
+        self.sigma_dim = sigma_dim
+        
+        # Same architecture as UNet
+        self.inc = DoubleConv(c_in, 64)
+        self.down1 = Down(64, 128)
+        self.sa1 = SelfAttention(128, 32)
+        self.down2 = Down(128, 256)
+        self.sa2 = SelfAttention(256, 16)
+        self.down3 = Down(256, 256)
+        self.sa3 = SelfAttention(256, 8)
+        
+        self.bot1 = DoubleConv(256, 512)
+        self.bot2 = DoubleConv(512, 512)
+        self.bot3 = DoubleConv(512, 512)
+        
+        self.up1 = Up(768, 128)
+        self.sa4 = SelfAttention(128, 16)
+        self.up2 = Up(256, 64)
+        self.sa5 = SelfAttention(64, 32)
+        self.up3 = Up(128, 64)
+        self.sa6 = SelfAttention(64, 64)
+        self.outc = nn.Conv2d(64, c_out, kernel_size=1)
+        
+        # Sigma embedding (replaces timestep encoding)
+        self.sigma_embed = nn.Sequential(
+            nn.Linear(1, sigma_dim),
+            nn.SiLU(),
+            nn.Linear(sigma_dim, sigma_dim),
+        )
+    
+    def sigma_embedding(self, sigma):
+        """
+        Embed continuous sigma (noise level) values.
+        
+        Args:
+            sigma: Noise levels (B,) - actual sigma values
+        
+        Returns:
+            Embedded sigma (B, sigma_dim)
+        """
+        # Use log(sigma) for better numerical stability
+        sigma_log = torch.log(sigma + 1e-8).unsqueeze(-1)  # (B, 1)
+        return self.sigma_embed(sigma_log)  # (B, sigma_dim)
+    
+    def forward(self, x, sigma):
+        """
+        Forward pass.
+        
+        Args:
+            x: Noisy images (B, C, H, W)
+            sigma: Noise levels (B,) - actual sigma values, not indices
+        
+        Returns:
+            Predicted score (B, C, H, W)
+        """
+        # Embed sigma values
+        sigma_emb = self.sigma_embedding(sigma)  # (B, sigma_dim)
+        
+        # Forward pass (same as UNet)
+        x1 = self.inc(x)
+        x2 = self.down1(x1, sigma_emb)
+        x2 = self.sa1(x2)
+        x3 = self.down2(x2, sigma_emb)
+        x3 = self.sa2(x3)
+        x4 = self.down3(x3, sigma_emb)
+        x4 = self.sa3(x4)
+        
+        x4 = self.bot1(x4)
+        x4 = self.bot2(x4)
+        x4 = self.bot3(x4)
+        
+        x = self.up1(x4, x3, sigma_emb)
+        x = self.sa4(x)
+        x = self.up2(x, x2, sigma_emb)
+        x = self.sa5(x)
+        x = self.up3(x, x1, sigma_emb)
+        x = self.sa6(x)
+        output = self.outc(x)
+        
+        return output
     
