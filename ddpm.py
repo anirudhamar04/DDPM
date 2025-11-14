@@ -89,7 +89,7 @@ class Diffusion:
             target_class = target_class.to(self.device)
         
         x = torch.randn((n, 3, self.img_size, self.img_size)).to(self.device)
-        
+
         for i in tqdm(reversed(range(1, self.noise_steps)), position=0):
             t = (torch.ones(n) * i).long().to(self.device)
             
@@ -129,7 +129,7 @@ class Diffusion:
                 del x_clone, logits, log_probs, target_log_prob, grad, sigma_t
                 
                 # Clear cache periodically
-                if i % 100 == 0:
+                if i % 200 == 0:
                     torch.cuda.empty_cache()
             
             # Denoising step (same as regular sampling) - no gradients needed
