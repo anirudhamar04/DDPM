@@ -6,8 +6,8 @@ from torch import optim
 from tqdm import tqdm
 import logging
 from torch.utils.tensorboard import SummaryWriter
-from utils import setup_logging,save_images,get_data
-from modules import UNet
+from .utils import setup_logging,save_images,get_data
+from .modules import UNet
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',datefmt='%I:%M:%S %p')
 
@@ -62,6 +62,7 @@ class Diffusion:
     def sample_guided(self, model, classifier, target_class, n, guidance_scale=1.0):
         """
         Classifier-guided sampling: generate images conditioned on a target class.
+        Memory-optimized version for large batch sizes.
         
         Args:
             model: DDPM UNet model
@@ -77,6 +78,10 @@ class Diffusion:
         model.eval()
         classifier.eval()
         
+        # Clear any existing gradients
+        model.zero_grad(set_to_none=True)
+        classifier.zero_grad(set_to_none=True)
+        
         # Convert target_class to tensor if needed
         if isinstance(target_class, int):
             target_class = torch.full((n,), target_class, dtype=torch.long, device=self.device)
@@ -88,16 +93,17 @@ class Diffusion:
         for i in tqdm(reversed(range(1, self.noise_steps)), position=0):
             t = (torch.ones(n) * i).long().to(self.device)
             
-            # Get predicted noise from DDPM model
-            predicted_noise = model(x, t)
+            # Get predicted noise from DDPM model (no gradients needed)
+            with torch.no_grad():
+                predicted_noise = model(x, t)
             
             # Compute classifier guidance
             if guidance_scale > 0:
-                # Enable gradients for input
-                x.requires_grad_(True)
+                # Temporarily enable gradients only for this computation
+                x_clone = x.detach().requires_grad_(True)
                 
                 # Get classifier logits
-                logits = classifier(x, t)
+                logits = classifier(x_clone, t)
                 
                 # Compute log probability for target class
                 # Use log_softmax for numerical stability
@@ -107,9 +113,10 @@ class Diffusion:
                 # Compute gradient: grad_x log p(y|x_t, t)
                 grad = torch.autograd.grad(
                     outputs=target_log_prob.sum(),
-                    inputs=x,
+                    inputs=x_clone,
                     create_graph=False,
-                    retain_graph=False
+                    retain_graph=False,
+                    only_inputs=True
                 )[0]
                 
                 # Modify predicted noise with classifier gradient
@@ -118,25 +125,31 @@ class Diffusion:
                 sigma_t = torch.sqrt(self.beta[t])[:, None, None, None]
                 predicted_noise = predicted_noise - guidance_scale * sigma_t * grad
                 
-                # Disable gradients for next iteration
-                x = x.detach()
-
-                torch.cuda.empty_cache()
+                # Explicitly delete intermediate tensors to free memory
+                del x_clone, logits, log_probs, target_log_prob, grad, sigma_t
                 
-
+                # Clear cache periodically
+                if i % 100 == 0:
+                    torch.cuda.empty_cache()
             
-            # Denoising step (same as regular sampling)
-            alpha = self.alpha[t][:, None, None, None]
-            alpha_hat = self.alpha_hat[t][:, None, None, None]
-            beta = self.beta[t][:, None, None, None]
-            
-            if i > 1:
-                noise = torch.randn_like(x)
-            else:
-                noise = torch.zeros_like(x)
-            
-            x = 1 / torch.sqrt(alpha) * (x - ((1 - alpha) / (torch.sqrt(1 - alpha_hat))) * predicted_noise) + torch.sqrt(beta) * noise
+            # Denoising step (same as regular sampling) - no gradients needed
+            with torch.no_grad():
+                alpha = self.alpha[t][:, None, None, None]
+                alpha_hat = self.alpha_hat[t][:, None, None, None]
+                beta = self.beta[t][:, None, None, None]
+                
+                if i > 1:
+                    noise = torch.randn_like(x)
+                else:
+                    noise = torch.zeros_like(x)
+                
+                x = 1 / torch.sqrt(alpha) * (x - ((1 - alpha) / (torch.sqrt(1 - alpha_hat))) * predicted_noise) + torch.sqrt(beta) * noise
+                
+                # Clean up intermediate tensors
+                del predicted_noise, alpha, alpha_hat, beta, noise, t
         
+        # Final cleanup
+        torch.cuda.empty_cache()
         model.train()
         classifier.train()
         

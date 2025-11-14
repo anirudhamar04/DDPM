@@ -2,10 +2,10 @@ import os
 import argparse
 import torch
 import logging
-from ddpm import Diffusion
-from modules import UNet
-from classifier import Classifier
-from utils import save_images, setup_logging
+from .ddpm import Diffusion
+from .modules import UNet
+from .classifier import Classifier
+from .utils import save_images, setup_logging
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%I:%M:%S %p')
 
@@ -183,4 +183,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 

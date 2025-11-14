@@ -10,9 +10,9 @@ import logging
 import torchvision
 import torchvision.transforms as transforms
 
-from utils import setup_logging
-from classifier import Classifier
-from ddpm import Diffusion
+from .utils import setup_logging
+from .classifier import Classifier
+from .ddpm import Diffusion
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%I:%M:%S %p')
 
