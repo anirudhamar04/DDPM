@@ -40,7 +40,8 @@ class NCSN:
         self.langevin_step_size = langevin_step_size
         
         # Create geometric progression of noise levels: σ_1 > σ_2 > ... > σ_L
-        # σ_i = σ_max * (σ_min/σ_max)^((i-1)/(L-1))
+        # σ_i = σ_max * (σ_min/σ_max)^(i/(L-1))
+        # When i=0: σ_max, when i=L-1: σ_min
         self.sigmas = torch.tensor([
             sigma_max * (sigma_min / sigma_max) ** (i / (num_noise_levels - 1))
             for i in range(num_noise_levels)
@@ -139,7 +140,11 @@ class NCSN:
     def sample_annealed(self, model, n):
         """
         Generate samples using annealed Langevin dynamics (better quality).
-        Uses decreasing step sizes for each noise level.
+        Following the NCSN paper: uses fixed step size ε, annealing comes from decreasing σ.
+        
+        According to the paper (Algorithm 1):
+        - α_t = 2ε * σ_i² where ε is a small constant
+        - The annealing effect comes from σ decreasing, not from scaling ε
         
         Args:
             model: Trained score network
@@ -156,15 +161,17 @@ class NCSN:
         
         with torch.no_grad():
             for i, sigma in enumerate(tqdm(self.sigmas, desc="Annealed Sampling")):
-                # Adaptive step size: smaller for lower noise levels
-                epsilon = self.langevin_step_size * (sigma / self.sigmas[-1]) ** 2
+                # Use fixed step size ε (annealing comes from σ decreasing)
+                # According to paper: α = 2ε * σ² where ε is constant
+                epsilon = self.langevin_step_size
                 
                 # Run Langevin dynamics
                 for step in range(self.langevin_steps):
                     sigma_batch = sigma.expand(n)
                     score = model(x, sigma_batch)
                     
-                    # Langevin step
+                    # Langevin step: x ← x + (α/2) * score + √α * z
+                    # where α = 2ε * σ²
                     alpha = 2 * epsilon * (sigma ** 2)
                     noise_term = torch.randn_like(x) * torch.sqrt(alpha)
                     
@@ -207,8 +214,8 @@ class NCSN:
         
         with torch.no_grad():
             for i, sigma in enumerate(tqdm(self.sigmas, desc="Guided Sampling")):
-                # Adaptive step size
-                epsilon = self.langevin_step_size * (sigma / self.sigmas[-1]) ** 2
+                # Use fixed step size ε (annealing comes from σ decreasing)
+                epsilon = self.langevin_step_size
                 
                 for step in range(self.langevin_steps):
                     sigma_batch = sigma.expand(n)
