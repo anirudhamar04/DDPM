@@ -325,22 +325,48 @@ def train(args):
             # Predict score
             score_pred = model(x_noisy, sigma_values)
             
-            # Compute loss with weighting: λ(σ) = σ² (as in NCSN paper)
-            sigma_weights = ncsn.sigmas[sigma_indices].view(-1, 1, 1, 1) ** 2
-            loss = mse(score_pred, score_target)
-            weighted_loss = (loss * sigma_weights).mean()
+            # FIXED: Compute weighted loss correctly
+            # NCSN loss: L = E[λ(σ) * ||s_θ(x, σ) - ∇_x log p_σ(x)||²]
+            # where λ(σ) = σ²
+            # Compute squared error per element
+            squared_error = (score_pred - score_target) ** 2  # (B, C, H, W)
             
-            # Backward pass
+            # Get per-sample weights: σ² for each sample
+            sigma_weights = ncsn.sigmas[sigma_indices] ** 2  # (B,)
+            sigma_weights = sigma_weights.view(-1, 1, 1, 1)  # (B, 1, 1, 1)
+            
+            # Weight the squared error, then average over all dimensions
+            weighted_squared_error = squared_error * sigma_weights  # (B, C, H, W)
+            loss = weighted_squared_error.mean()
+            
+            # Backward pass with gradient clipping
             optimizer.zero_grad()
-            weighted_loss.backward()
+            loss.backward()
+            
+            # Gradient clipping to prevent explosion
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
             
-            epoch_loss += weighted_loss.item()
-            pbar.set_postfix(Loss=weighted_loss.item())
-            logger.add_scalar("Loss", weighted_loss.item(), global_step=epoch * l + i)
+            epoch_loss += loss.item()
+            pbar.set_postfix(Loss=loss.item())
+            logger.add_scalar("Loss", loss.item(), global_step=epoch * l + i)
+            
+            # Log per-noise-level statistics periodically
+            if i % 100 == 0:
+                with torch.no_grad():
+                    # Log average loss per noise level
+                    for idx in range(ncsn.num_noise_levels):
+                        mask = (sigma_indices == idx)
+                        if mask.any():
+                            level_loss = weighted_squared_error[mask].mean().item()
+                            logger.add_scalar(f"Loss/NoiseLevel_{idx}_sigma_{ncsn.sigmas[idx]:.2f}", 
+                                            level_loss, global_step=epoch * l + i)
+        
         
         avg_loss = epoch_loss / len(dataloader)
         logging.info(f"Epoch {epoch} average loss: {avg_loss:.4f}")
+        logger.add_scalar("Epoch/Avg_Loss", avg_loss, epoch)  # Add this line
         
         # Sample and save images
         sampled_images = ncsn.sample_annealed(model, n=images.shape[0])
