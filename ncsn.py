@@ -6,8 +6,8 @@ from torch import optim
 from tqdm import tqdm
 import logging
 from torch.utils.tensorboard import SummaryWriter
-from .utils import setup_logging, save_images, get_data
-from .modules import UNetNCSN
+from utils import setup_logging, save_images, get_data
+from modules import UNetNCSN
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%I:%M:%S %p')
 
@@ -19,8 +19,8 @@ class NCSN:
     by Song & Ermon, NeurIPS 2019.
     """
     
-    def __init__(self, sigma_min=0.01, sigma_max=50.0, num_noise_levels=10, 
-                 img_size=64, device="cuda", langevin_steps=10, langevin_step_size=2e-5):
+    def __init__(self, sigma_min=0.01, sigma_max=50.0, num_noise_levels=100, 
+                 img_size=64, device="cuda", langevin_steps=100, langevin_step_size=1e-4):
         """
         Args:
             sigma_min: Minimum noise level (finest scale)
@@ -287,11 +287,34 @@ def train(args):
     logger = SummaryWriter(os.path.join("runs", args.run_name))
     l = len(dataloader)
     
+    # Initialize EMA model
+    ema_decay = getattr(args, 'ema_decay', 0.9999)  # Default EMA decay
+    ema_model = UNetNCSN(device=device).to(device)
+    ema_model.load_state_dict(model.state_dict())  # Initialize with same weights
+    ema_model.eval()  # EMA model is always in eval mode
+    
+    def update_ema(ema_model, model, decay):
+        """Update EMA model weights"""
+        with torch.no_grad():
+            for ema_param, param in zip(ema_model.parameters(), model.parameters()):
+                ema_param.data.mul_(decay).add_(param.data, alpha=1 - decay)
+    
     start_epoch = 0
     if hasattr(args, 'model_path') and args.model_path:
         if os.path.exists(args.model_path):
             logging.info(f"Loading checkpoint from {args.model_path}")
-            model.load_state_dict(torch.load(args.model_path, map_location=device))
+            checkpoint = torch.load(args.model_path, map_location=device)
+            model.load_state_dict(checkpoint)
+            
+            # Try to load EMA weights if available
+            ema_path = args.model_path.replace('.pth', '_ema.pth')
+            if os.path.exists(ema_path):
+                logging.info(f"Loading EMA weights from {ema_path}")
+                ema_model.load_state_dict(torch.load(ema_path, map_location=device))
+            else:
+                # Initialize EMA from current model if no EMA checkpoint
+                ema_model.load_state_dict(model.state_dict())
+            
             filename = os.path.basename(args.model_path)
             try:
                 start_epoch = int(filename.split('.')[0]) + 1
@@ -300,6 +323,8 @@ def train(args):
                 logging.warning(f"Could not extract epoch number from {filename}, starting from epoch 0")
         else:
             logging.warning(f"Checkpoint path {args.model_path} does not exist, starting from scratch")
+    
+    logging.info(f"Using EMA with decay={ema_decay}")
     
     for epoch in range(start_epoch, args.epochs):
         logging.info(f"Starting epoch {epoch}:")
@@ -348,6 +373,9 @@ def train(args):
             
             optimizer.step()
             
+            # Update EMA model after optimizer step
+            update_ema(ema_model, model, ema_decay)
+            
             epoch_loss += loss.item()
             pbar.set_postfix(Loss=loss.item())
             logger.add_scalar("Loss", loss.item(), global_step=epoch * l + i)
@@ -366,12 +394,16 @@ def train(args):
         
         avg_loss = epoch_loss / len(dataloader)
         logging.info(f"Epoch {epoch} average loss: {avg_loss:.4f}")
-        logger.add_scalar("Epoch/Avg_Loss", avg_loss, epoch)  # Add this line
+        logger.add_scalar("Epoch/Avg_Loss", avg_loss, epoch)
         
-        # Sample and save images
-        sampled_images = ncsn.sample_annealed(model, n=images.shape[0])
-        save_images(sampled_images, os.path.join("results", args.run_name, f"{epoch}.png"))
-        torch.save(model.state_dict(), os.path.join("models", args.run_name, f"{epoch}.pth"))
+        if epoch % 5 == 0:
+            # Sample and save images using EMA model (better quality)
+            sampled_images = ncsn.sample_annealed(ema_model, n=images.shape[0])
+            save_images(sampled_images, os.path.join("results", args.run_name, f"{epoch}.png"))
+            
+            # Save both regular and EMA models
+            torch.save(model.state_dict(), os.path.join("models", args.run_name, f"{epoch}.pth"))
+            torch.save(ema_model.state_dict(), os.path.join("models", args.run_name, f"{epoch}_ema.pth"))
 
 
 def launch():
