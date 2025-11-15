@@ -7,7 +7,7 @@ from tqdm import tqdm
 import logging
 from torch.utils.tensorboard import SummaryWriter
 from .utils import setup_logging, save_images, get_data
-from .modules import UNetNCSN
+from .modules import RefineNetNCSN
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%I:%M:%S %p')
 
@@ -274,7 +274,7 @@ def train(args):
     setup_logging(args.run_name)
     device = args.device if torch.cuda.is_available() else "cpu"
     dataloader = get_data(args)
-    model = UNetNCSN(device=device).to(device)
+    model = RefineNetNCSN(device=device).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr,betas=(0.9,0.999))
     mse = nn.MSELoss()
     ncsn = NCSN(
@@ -289,7 +289,7 @@ def train(args):
     
     # Initialize EMA model
     ema_decay = getattr(args, 'ema_decay', 0.9999)  # Default EMA decay
-    ema_model = UNetNCSN(device=device).to(device)
+    ema_model = RefineNetNCSN(device=device).to(device)
     ema_model.load_state_dict(model.state_dict())  # Initialize with same weights
     ema_model.eval()  # EMA model is always in eval mode
     
