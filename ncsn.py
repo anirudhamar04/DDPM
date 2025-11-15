@@ -92,7 +92,7 @@ class NCSN:
             sigma = self.sigmas[sigma_idx].view(-1, 1, 1, 1)
         
         # Score = -(noisy - clean) / σ²
-        score_target = (x_noisy - x_clean) / (sigma ** 2 + 1e-8)
+        score_target = -(x_noisy - x_clean) / (sigma ** 2 + 1e-8)
         return score_target
     
     def sample(self, model, n):
