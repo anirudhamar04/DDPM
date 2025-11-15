@@ -200,6 +200,9 @@ class CondInstanceNormPlusPlus(nn.Module):
             x: Input tensor (B, C, H, W)
             sigma_emb: Sigma embedding (B, emb_dim)
         """
+        # Get actual number of channels from input
+        actual_channels = x.shape[1]
+        
         # Compute means across spatial dimensions: (B, C)
         means = torch.mean(x, dim=(2, 3))
         
@@ -208,23 +211,51 @@ class CondInstanceNormPlusPlus(nn.Module):
         v = torch.var(means, dim=-1, keepdim=True)
         means_normalized = (means - m) / (torch.sqrt(v + 1e-5))
         
-        # Apply instance normalization
-        h = self.instance_norm(x)
+        # Apply instance normalization - handle channel mismatch
+        if actual_channels != self.num_features:
+            # Manually compute instance norm for mismatched channels
+            # Compute mean and var across spatial dimensions
+            x_mean = torch.mean(x, dim=(2, 3), keepdim=True)  # (B, C, 1, 1)
+            x_var = torch.var(x, dim=(2, 3), keepdim=True, unbiased=False)  # (B, C, 1, 1)
+            eps = 1e-5
+            h = (x - x_mean) / torch.sqrt(x_var + eps)
+        else:
+            h = self.instance_norm(x)
         
         # Add normalized means back with learnable alpha
-        h = h + means_normalized[..., None, None] * self.alpha.view(1, self.num_features, 1, 1)
+        # Ensure alpha matches actual_channels
+        if actual_channels == self.num_features:
+            alpha = self.alpha
+        else:
+            # If mismatch, use only the first actual_channels elements
+            alpha = self.alpha[:actual_channels]
+        
+        h = h + means_normalized[..., None, None] * alpha.view(1, actual_channels, 1, 1)
         
         # Apply learnable gamma and beta
-        if self.bias:
-            h = self.gamma.view(-1, self.num_features, 1, 1) * h + self.beta.view(-1, self.num_features, 1, 1)
+        if actual_channels == self.num_features:
+            gamma = self.gamma
+            beta = self.beta if self.bias else None
         else:
-            h = self.gamma.view(-1, self.num_features, 1, 1) * h
+            gamma = self.gamma[:actual_channels]
+            beta = self.beta[:actual_channels] if self.bias else None
+            
+        if self.bias:
+            h = gamma.view(-1, actual_channels, 1, 1) * h + beta.view(-1, actual_channels, 1, 1)
+        else:
+            h = gamma.view(-1, actual_channels, 1, 1) * h
         
         # Apply conditional scale and shift from sigma embedding
-        cond_scale = self.cond_scale(sigma_emb)  # (B, C)
-        cond_shift = self.cond_shift(sigma_emb)  # (B, C)
-        cond_scale = cond_scale.view(-1, self.num_features, 1, 1)
-        cond_shift = cond_shift.view(-1, self.num_features, 1, 1)
+        # Need to ensure cond_scale/shift output matches actual_channels
+        cond_scale = self.cond_scale(sigma_emb)  # (B, num_features)
+        cond_shift = self.cond_shift(sigma_emb)  # (B, num_features)
+        
+        if actual_channels != self.num_features:
+            cond_scale = cond_scale[:, :actual_channels]
+            cond_shift = cond_shift[:, :actual_channels]
+            
+        cond_scale = cond_scale.view(-1, actual_channels, 1, 1)
+        cond_shift = cond_shift.view(-1, actual_channels, 1, 1)
         
         out = cond_scale * h + cond_shift
         return out
