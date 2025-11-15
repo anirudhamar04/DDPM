@@ -3,7 +3,7 @@ Package initialization file that exports commonly used classes.
 Allows importing UNet, Diffusion, and Classifier from outside this package.
 """
 
-from .modules import UNet, UNetNCSN
+from .modules import UNet, RefineNetNCSN
 from .ddpm import Diffusion
 from .classifier import Classifier
 
