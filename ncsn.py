@@ -19,8 +19,8 @@ class NCSN:
     by Song & Ermon, NeurIPS 2019.
     """
     
-    def __init__(self, sigma_min=0.01, sigma_max=50.0, num_noise_levels=100, 
-                 img_size=64, device="cuda", langevin_steps=100, langevin_step_size=1e-4):
+    def __init__(self, sigma_min=0.01, sigma_max=50.0, num_noise_levels=50, 
+                 img_size=64, device="cuda", langevin_steps=20, langevin_step_size=5e-5):
         """
         Args:
             sigma_min: Minimum noise level (finest scale)
