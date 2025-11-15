@@ -163,18 +163,26 @@ class UNet(nn.Module):
 
 class CondInstanceNormPlusPlus(nn.Module):
     """
-    Conditional Instance Normalization++ (CondInstanceNorm++) for NCSN.
+    Conditional Instance Normalization++ (InstanceNorm2dPlus) for NCSN.
+    Matches the official implementation: normalizes instance stats AND channel means.
     Conditions on sigma embedding as specified in the paper.
-    Replaces batch normalization in RefineNet.
     """
-    def __init__(self, num_features, emb_dim=256, eps=1e-5):
+    def __init__(self, num_features, emb_dim=256, bias=True):
         super(CondInstanceNormPlusPlus, self).__init__()
         self.num_features = num_features
-        self.eps = eps
+        self.bias = bias
         
-        # Learnable parameters
-        self.weight = nn.Parameter(torch.ones(num_features))
-        self.bias = nn.Parameter(torch.zeros(num_features))
+        # Use standard InstanceNorm2d without affine (we'll add our own)
+        self.instance_norm = nn.InstanceNorm2d(num_features, affine=False, track_running_stats=False)
+        
+        # Learnable parameters for channel mean normalization
+        self.alpha = nn.Parameter(torch.zeros(num_features))
+        self.gamma = nn.Parameter(torch.zeros(num_features))
+        self.alpha.data.normal_(1, 0.02)
+        self.gamma.data.normal_(1, 0.02)
+        
+        if bias:
+            self.beta = nn.Parameter(torch.zeros(num_features))
         
         # Conditional parameters from sigma embedding
         self.cond_scale = nn.Sequential(
@@ -192,54 +200,59 @@ class CondInstanceNormPlusPlus(nn.Module):
             x: Input tensor (B, C, H, W)
             sigma_emb: Sigma embedding (B, emb_dim)
         """
-        B, C, H, W = x.shape
+        # Compute means across spatial dimensions: (B, C)
+        means = torch.mean(x, dim=(2, 3))
         
-        # Instance normalization
-        x_reshaped = x.view(B, C, H * W)
-        mean = x_reshaped.mean(dim=2, keepdim=True)  # (B, C, 1)
-        var = x_reshaped.var(dim=2, keepdim=True, unbiased=False)  # (B, C, 1)
+        # Normalize means across channels: (B, 1)
+        m = torch.mean(means, dim=-1, keepdim=True)
+        v = torch.var(means, dim=-1, keepdim=True)
+        means_normalized = (means - m) / (torch.sqrt(v + 1e-5))
         
-        # Normalize
-        x_norm = (x_reshaped - mean) / torch.sqrt(var + self.eps)  # (B, C, H*W)
-        x_norm = x_norm.view(B, C, H, W)
+        # Apply instance normalization
+        h = self.instance_norm(x)
         
-        # Conditional scaling and shifting
-        scale = self.cond_scale(sigma_emb)  # (B, C)
-        shift = self.cond_shift(sigma_emb)  # (B, C)
+        # Add normalized means back with learnable alpha
+        h = h + means_normalized[..., None, None] * self.alpha[..., None, None]
         
-        # Apply conditional parameters
-        scale = scale.view(B, C, 1, 1)
-        shift = shift.view(B, C, 1, 1)
+        # Apply learnable gamma and beta
+        if self.bias:
+            h = self.gamma.view(-1, self.num_features, 1, 1) * h + self.beta.view(-1, self.num_features, 1, 1)
+        else:
+            h = self.gamma.view(-1, self.num_features, 1, 1) * h
         
-        # Apply learnable weight and bias, then conditional scale and shift
-        out = self.weight.view(1, C, 1, 1) * x_norm + self.bias.view(1, C, 1, 1)
-        out = scale * out + shift
+        # Apply conditional scale and shift from sigma embedding
+        cond_scale = self.cond_scale(sigma_emb)  # (B, C)
+        cond_shift = self.cond_shift(sigma_emb)  # (B, C)
+        cond_scale = cond_scale.view(-1, self.num_features, 1, 1)
+        cond_shift = cond_shift.view(-1, self.num_features, 1, 1)
         
+        out = cond_scale * h + cond_shift
         return out
 
 
 class ResidualConvUnit(nn.Module):
     """
     Residual Convolution Unit (RCU) for RefineNet.
-    Applies residual convolutions with CondInstanceNorm++ and ELU activation.
+    PRE-ACTIVATION: norm -> act -> conv (as in official code)
     """
     def __init__(self, channels, n_blocks=2, emb_dim=256):
         super(ResidualConvUnit, self).__init__()
         self.blocks = nn.ModuleList()
         for i in range(n_blocks):
-            self.blocks.append(nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False))
-            self.blocks.append(CondInstanceNormPlusPlus(channels, emb_dim))
-            self.blocks.append(nn.ELU(inplace=True))
+            for j in range(2):  # 2 stages per block: norm->act->conv
+                self.blocks.append(CondInstanceNormPlusPlus(channels, emb_dim))
+                self.blocks.append(nn.ELU(inplace=True))
+                self.blocks.append(nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False))
     
     def forward(self, x, sigma_emb):
         residual = x
         i = 0
         while i < len(self.blocks):
-            if isinstance(self.blocks[i], nn.Conv2d):
-                x = self.blocks[i](x)
-            elif isinstance(self.blocks[i], CondInstanceNormPlusPlus):
+            if isinstance(self.blocks[i], CondInstanceNormPlusPlus):
                 x = self.blocks[i](x, sigma_emb)
-            else:  # ELU
+            elif isinstance(self.blocks[i], nn.ELU):
+                x = self.blocks[i](x)
+            else:  # Conv2d
                 x = self.blocks[i](x)
             i += 1
         return x + residual
@@ -248,67 +261,62 @@ class ResidualConvUnit(nn.Module):
 class MultiResolutionFusion(nn.Module):
     """
     Multi-Resolution Fusion (MRF) module.
-    Fuses features from different resolutions with CondInstanceNorm++ and ELU.
+    Order: norm -> conv (as in official code, no ELU after)
     """
     def __init__(self, channels_list, out_channels, emb_dim=256):
         super(MultiResolutionFusion, self).__init__()
         self.channels_list = channels_list
         self.out_channels = out_channels
         
-        # Convolution layers for each input resolution
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
         for channels in channels_list:
+            self.norms.append(CondInstanceNormPlusPlus(channels, emb_dim))
             if channels != out_channels:
-                self.convs.append(nn.Conv2d(channels, out_channels, kernel_size=3, padding=1, bias=False))
-                self.norms.append(CondInstanceNormPlusPlus(out_channels, emb_dim))
+                self.convs.append(nn.Conv2d(channels, out_channels, kernel_size=3, padding=1, bias=True))
             else:
                 self.convs.append(nn.Identity())
-                self.norms.append(None)
     
     def forward(self, *inputs, sigma_emb):
-        # Upsample all inputs to the same size (largest resolution)
         target_size = inputs[0].shape[2:]
         upsampled = []
         
         for i, x in enumerate(inputs):
             if x.shape[2:] != target_size:
-                x = F.interpolate(x, size=target_size, mode='bilinear', align_corners=False)
+                x = F.interpolate(x, size=target_size, mode='bilinear', align_corners=True)
+            x = self.norms[i](x, sigma_emb)
             x = self.convs[i](x)
-            if self.norms[i] is not None:
-                x = self.norms[i](x, sigma_emb)
-            x = F.elu(x, inplace=True)
             upsampled.append(x)
         
-        # Sum all upsampled features
         return sum(upsampled)
 
 
 class ChainedResidualPooling(nn.Module):
     """
     Chained Residual Pooling (CRP) module.
+    Order: act -> norm -> pool -> conv (as in official code)
     Uses average pooling (not max pooling) as specified in the paper.
-    Applies chained average pooling operations with residual connections.
     """
     def __init__(self, channels, n_stages=2, emb_dim=256):
         super(ChainedResidualPooling, self).__init__()
+        self.n_stages = n_stages
+        self.act = nn.ELU(inplace=True)
         self.pools = nn.ModuleList()
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
         for i in range(n_stages):
-            # Paper uses average pooling, not max pooling
             self.pools.append(nn.AvgPool2d(kernel_size=5, stride=1, padding=2))
-            self.convs.append(nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False))
             self.norms.append(CondInstanceNormPlusPlus(channels, emb_dim))
+            self.convs.append(nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False))
     
     def forward(self, x, sigma_emb):
         out = x
-        for pool, conv, norm in zip(self.pools, self.convs, self.norms):
-            pooled = pool(out)
-            out_conv = conv(pooled)
-            out_norm = norm(out_conv, sigma_emb)
-            out_elu = F.elu(out_norm, inplace=True)
-            out = out_elu + out
+        for i in range(self.n_stages):
+            out = self.act(out)
+            out = self.norms[i](out, sigma_emb)
+            out = self.pools[i](out)
+            out = self.convs[i](out)
+            out = out + x  # Residual connection
         return out
 
 
@@ -450,21 +458,34 @@ class RefineNetNCSN(nn.Module):
         # Embed sigma values
         sigma_emb = self.sigma_embedding(sigma)  # (B, sigma_dim)
         
-        # Initial convolution with pre-activation (ELU before conv)
-        x0 = F.elu(self.norm_in(self.conv_in(x), sigma_emb), inplace=True)  # (B, 128, H, W)
+        # Initial convolution: norm -> act -> conv (pre-activation)
+        x0 = self.norm_in(self.conv_in(x), sigma_emb)
+        x0 = F.elu(x0, inplace=True)
         
-        # Encoder path with pre-activation residual blocks
-        # Block 1: stride=2 (first block)
-        x1_res = F.elu(self.encoder1_norm1(self.encoder1_conv1(x0), sigma_emb), inplace=True)
-        x1 = F.elu(self.encoder1_norm2(self.encoder1_conv2(x1_res), sigma_emb), inplace=True)  # (B, 256, H/2, W/2)
+        # Encoder path with PRE-ACTIVATION: norm -> act -> conv -> norm -> act -> conv
+        # Block 1
+        x1 = self.encoder1_norm1(x0, sigma_emb)
+        x1 = F.elu(x1, inplace=True)
+        x1 = self.encoder1_conv1(x1)
+        x1 = self.encoder1_norm2(x1, sigma_emb)
+        x1 = F.elu(x1, inplace=True)
+        x1 = self.encoder1_conv2(x1)
         
-        # Block 2: dilation=2
-        x2_res = F.elu(self.encoder2_norm1(self.encoder2_conv1(x1), sigma_emb), inplace=True)
-        x2 = F.elu(self.encoder2_norm2(self.encoder2_conv2(x2_res), sigma_emb), inplace=True)  # (B, 512, H/2, W/2)
+        # Block 2
+        x2 = self.encoder2_norm1(x1, sigma_emb)
+        x2 = F.elu(x2, inplace=True)
+        x2 = self.encoder2_conv1(x2)
+        x2 = self.encoder2_norm2(x2, sigma_emb)
+        x2 = F.elu(x2, inplace=True)
+        x2 = self.encoder2_conv2(x2)
         
-        # Block 3: dilation=4
-        x3_res = F.elu(self.encoder3_norm1(self.encoder3_conv1(x2), sigma_emb), inplace=True)
-        x3 = F.elu(self.encoder3_norm2(self.encoder3_conv2(x3_res), sigma_emb), inplace=True)  # (B, 512, H/2, W/2)
+        # Block 3
+        x3 = self.encoder3_norm1(x2, sigma_emb)
+        x3 = F.elu(x3, inplace=True)
+        x3 = self.encoder3_conv1(x3)
+        x3 = self.encoder3_norm2(x3, sigma_emb)
+        x3 = F.elu(x3, inplace=True)
+        x3 = self.encoder3_conv2(x3)
         
         # RefineNet decoder path with sigma conditioning
         # Each block fuses features from corresponding encoder level and previous refinenet block

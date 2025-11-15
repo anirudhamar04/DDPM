@@ -1,20 +1,20 @@
-from modules import UNetNCSN
+from modules import RefineNetNCSN
 from ncsn import NCSN
 import torch
 import matplotlib.pyplot as plt
 import torchvision
 
 device="cuda"
-model_path=r"models\60.pth"
-model=UNetNCSN(device=device).to(device)
+model_path=r"models\180_ema.pth"
+model=RefineNetNCSN(device=device).to(device)
 ncsn=NCSN(img_size=64,device=device)
 model.load_state_dict(torch.load(model_path, map_location=device))
 
 ncsn_better = NCSN(
-    sigma_min=0.01, sigma_max=50.0, num_noise_levels=10,
+    sigma_min=0.01, sigma_max=50.0, num_noise_levels=50,
     img_size=64, device="cuda",
     langevin_steps=100,  # More steps
-    langevin_step_size=2e-5
+    langevin_step_size=5e-4
 )
 samples = ncsn_better.sample_annealed(model, n=3)
 
