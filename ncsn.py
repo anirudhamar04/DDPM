@@ -98,6 +98,7 @@ class NCSN:
     def sample(self, model, n):
         """
         Generate samples using Langevin dynamics.
+        Following the NCSN paper Algorithm 1: α_i = ε · σ_i² / σ_L²
         
         Args:
             model: Trained score network
@@ -112,9 +113,15 @@ class NCSN:
         # Start from highest noise level
         x = torch.randn((n, 3, self.img_size, self.img_size), device=self.device) * self.sigmas[0]
         
+        # σ_L is the smallest noise level
+        sigma_L = self.sigmas[-1]
+        
         with torch.no_grad():
             # Iterate through noise levels from high to low
             for i, sigma in enumerate(tqdm(self.sigmas, desc="NCSN Sampling")):
+                # Paper formula: α_i = ε · σ_i² / σ_L²
+                alpha = self.langevin_step_size * (sigma ** 2) / (sigma_L ** 2)
+                
                 # Run Langevin dynamics for this noise level
                 for step in range(self.langevin_steps):
                     # Predict score
@@ -122,10 +129,7 @@ class NCSN:
                     score = model(x, sigma_batch)
                     
                     # Langevin step: x ← x + (α/2) * score + √α * z
-                    # where α = 2 * ε * σ² (ε is step size)
-                    alpha = 2 * self.langevin_step_size * (sigma ** 2)
                     noise_term = torch.randn_like(x) * torch.sqrt(alpha)
-                    
                     x = x + (alpha / 2) * score + noise_term
         
         # Clamp to valid range
@@ -139,12 +143,9 @@ class NCSN:
     
     def sample_annealed(self, model, n):
         """
-        Generate samples using annealed Langevin dynamics (better quality).
-        Following the NCSN paper: uses fixed step size ε, annealing comes from decreasing σ.
-        
-        According to the paper (Algorithm 1):
-        - α_t = 2ε * σ_i² where ε is a small constant
-        - The annealing effect comes from σ decreasing, not from scaling ε
+        Generate samples using annealed Langevin dynamics.
+        Following the NCSN paper Algorithm 1 exactly:
+        - α_i = ε · σ_i² / σ_L² where ε is step size and σ_L is smallest noise level
         
         Args:
             model: Trained score network
@@ -159,11 +160,13 @@ class NCSN:
         # Start from highest noise level
         x = torch.randn((n, 3, self.img_size, self.img_size), device=self.device) * self.sigmas[0]
         
+        # σ_L is the smallest noise level (last in the list)
+        sigma_L = self.sigmas[-1]
+        
         with torch.no_grad():
             for i, sigma in enumerate(tqdm(self.sigmas, desc="Annealed Sampling")):
-                # Use fixed step size ε (annealing comes from σ decreasing)
-                # According to paper: α = 2ε * σ² where ε is constant
-                epsilon = self.langevin_step_size
+                # Paper formula: α_i = ε · σ_i² / σ_L²
+                alpha = self.langevin_step_size * (sigma ** 2) / (sigma_L ** 2)
                 
                 # Run Langevin dynamics
                 for step in range(self.langevin_steps):
@@ -171,10 +174,7 @@ class NCSN:
                     score = model(x, sigma_batch)
                     
                     # Langevin step: x ← x + (α/2) * score + √α * z
-                    # where α = 2ε * σ²
-                    alpha = 2 * epsilon * (sigma ** 2)
                     noise_term = torch.randn_like(x) * torch.sqrt(alpha)
-                    
                     x = x + (alpha / 2) * score + noise_term
         
         x = torch.clamp(x, -1, 1)
@@ -212,10 +212,13 @@ class NCSN:
         # Start from highest noise level
         x = torch.randn((n, 3, self.img_size, self.img_size), device=self.device) * self.sigmas[0]
         
+        # σ_L is the smallest noise level
+        sigma_L = self.sigmas[-1]
+        
         with torch.no_grad():
             for i, sigma in enumerate(tqdm(self.sigmas, desc="Guided Sampling")):
-                # Use fixed step size ε (annealing comes from σ decreasing)
-                epsilon = self.langevin_step_size
+                # Paper formula: α_i = ε · σ_i² / σ_L²
+                alpha = self.langevin_step_size * (sigma ** 2) / (sigma_L ** 2)
                 
                 for step in range(self.langevin_steps):
                     sigma_batch = sigma.expand(n)
@@ -254,7 +257,6 @@ class NCSN:
                         del grad, logits, log_probs, target_log_prob
                     
                     # Langevin step
-                    alpha = 2 * epsilon * (sigma ** 2)
                     noise_term = torch.randn_like(x) * torch.sqrt(alpha)
                     x = x + (alpha / 2) * score + noise_term
                     
@@ -403,7 +405,7 @@ def train(args):
         logging.info(f"Epoch {epoch} average loss: {avg_loss:.4f}")
         logger.add_scalar("Epoch/Avg_Loss", avg_loss, epoch)
         
-        if epoch % 5 == 0:
+        if epoch % 10 == 0:
             # Sample and save images using EMA model (better quality)
             sampled_images = ncsn.sample_annealed(ema_model, n=images.shape[0])
             save_images(sampled_images, os.path.join("results", args.run_name, f"{epoch}.png"))
@@ -425,12 +427,12 @@ def launch():
     args.image_size = 64
     args.dataset_path = r"data\train"
     args.device = "cuda"
-    args.lr = 1e-4
+    args.lr = 0.001  # Paper uses 0.001
     
-    # NCSN-specific parameters
+    # NCSN-specific parameters (matching paper)
     args.sigma_min = 0.01
     args.sigma_max = 50.0
-    args.num_noise_levels = 10
+    args.num_noise_levels = 50  # Paper uses 50+ noise levels
     
     train(args)
 
