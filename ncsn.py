@@ -6,8 +6,8 @@ from torch import optim
 from tqdm import tqdm
 import logging
 from torch.utils.tensorboard import SummaryWriter
-from utils import setup_logging, save_images, get_data
-from modules import UNetNCSN
+from .utils import setup_logging, save_images, get_data
+from .modules import UNetNCSN
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%I:%M:%S %p')
 
