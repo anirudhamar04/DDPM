@@ -212,7 +212,7 @@ class CondInstanceNormPlusPlus(nn.Module):
         h = self.instance_norm(x)
         
         # Add normalized means back with learnable alpha
-        h = h + means_normalized[..., None, None] * self.alpha[..., None, None]
+        h = h + means_normalized[..., None, None] * self.alpha.view(1, self.num_features, 1, 1)
         
         # Apply learnable gamma and beta
         if self.bias:
