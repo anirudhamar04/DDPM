@@ -20,7 +20,7 @@ class NCSN:
     """
     
     def __init__(self, sigma_min=0.01, sigma_max=50.0, num_noise_levels=50, 
-                 img_size=64, device="cuda", langevin_steps=100, langevin_step_size=5e-5):
+                 img_size=64, device="cuda", langevin_steps=10, langevin_step_size=1e-5):
         """
         Args:
             sigma_min: Minimum noise level (finest scale)
