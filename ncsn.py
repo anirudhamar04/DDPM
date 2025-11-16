@@ -432,7 +432,7 @@ def launch():
     # NCSN-specific parameters (matching paper)
     args.sigma_min = 0.01
     args.sigma_max = 50.0
-    args.num_noise_levels = 50  # Paper uses 50+ noise levels
+    args.num_noise_levels = 10  # Paper uses 50+ noise levels
     
     train(args)
 

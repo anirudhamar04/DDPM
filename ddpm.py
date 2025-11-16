@@ -159,7 +159,7 @@ class Diffusion:
         
         return x
     
-    def sample_ddim(self, model, n, num_steps=50, eta=0.0, x_T=None):
+    def sample_ddim(self, model, n, num_steps=200, eta=0.0, x_T=None):
         """
         DDIM (Denoising Diffusion Implicit Models) sampling.
         Deterministic sampling that can use fewer steps than DDPM.
@@ -215,13 +215,15 @@ class Diffusion:
                 # Predict noise
                 predicted_noise = model(x, t)
                 
-                # Get alpha_hat values
-                alpha_hat_curr = self.alpha_hat[t_curr]
+                # Get alpha_hat values - use tensor t to get shape (n,) instead of scalar
+                alpha_hat_curr = self.alpha_hat[t]  # Shape: (n,)
                 # For t_next, use alpha_hat[0] if we're at the final step, otherwise use alpha_hat[t_next]
                 if t_next < 0:
-                    alpha_hat_next = self.alpha_hat[0]  # Use first timestep's alpha_hat
+                    t_next_tensor = torch.zeros(n, dtype=torch.long, device=self.device)
+                    alpha_hat_next = self.alpha_hat[t_next_tensor]  # Shape: (n,)
                 else:
-                    alpha_hat_next = self.alpha_hat[t_next]
+                    t_next_tensor = (torch.ones(n) * t_next).long().to(self.device)
+                    alpha_hat_next = self.alpha_hat[t_next_tensor]  # Shape: (n,)
                 
                 # Predict x_0 (denoised image)
                 # x_0 = (x_t - sqrt(1 - alpha_hat_t) * epsilon) / sqrt(alpha_hat_t)
@@ -234,7 +236,7 @@ class Diffusion:
                 # Add stochastic noise if eta > 0
                 # Variance term for DDIM: sigma_t^2 = eta^2 * (1 - alpha_hat_{t-1}) / (1 - alpha_hat_t) * (1 - alpha_t)
                 if eta > 0 and t_next >= 0:
-                    alpha_curr = self.alpha[t_curr]
+                    alpha_curr = self.alpha[t]  # Shape: (n,)
                     alpha_hat_prev = alpha_hat_next  # This is alpha_hat[t_next]
                     # Avoid division by zero
                     denominator = (1.0 - alpha_hat_curr).clamp(min=1e-8)
@@ -255,108 +257,111 @@ class Diffusion:
         
         return x
     
-    def invert_ddim(self, model, x0, num_steps=50, eta=0.0, return_intermediates=False):
-        """
-        DDIM inversion: convert an image to noise using the reverse DDIM process.
-        This is useful for image editing tasks where you invert, modify, and then denoise.
+    # In invert_ddim method, around line 315-352, the code is correct but here's a cleaner version:
+
+def invert_ddim(self, model, x0, num_steps=200, eta=0.0, return_intermediates=False):
+    """
+    DDIM inversion: convert an image to noise using the reverse DDIM process.
+    This is useful for image editing tasks where you invert, modify, and then denoise.
+    
+    Args:
+        model: DDPM UNet model (same network trained for DDPM)
+        x0: Input image(s) to invert. Can be:
+            - Tensor of shape (n, 3, H, W) in range [-1, 1] (normalized)
+            - Tensor of shape (n, 3, H, W) in range [0, 255] (uint8)
+            - If uint8, will be automatically converted to [-1, 1]
+        num_steps: Number of inversion steps (default: 50, should match sampling steps)
+        eta: Controls stochasticity. eta=0.0 is fully deterministic DDIM, 
+             eta=1.0 recovers DDPM forward process. Default: 0.0 (deterministic)
+        return_intermediates: If True, returns list of all intermediate x_t values
+    
+    Returns:
+        If return_intermediates=False:
+            x_T: Inverted noise tensor (n, 3, H, W) in range [-1, 1]
+        If return_intermediates=True:
+            (x_T, intermediates): Tuple of final noise and list of all x_t values
+    """
+    model.eval()
+    
+    # Convert input to [-1, 1] range if needed
+    if x0.dtype == torch.uint8:
+        x0 = x0.float() / 255.0  # [0, 1]
+        x0 = x0 * 2.0 - 1.0  # [-1, 1]
+    elif x0.max() > 1.0:
+        # Assume [0, 255] range
+        x0 = x0 / 255.0
+        x0 = x0 * 2.0 - 1.0
+    
+    x0 = x0.to(self.device)
+    n = x0.shape[0]
+    
+    logging.info(f"DDIM Inverting {n} image(s) with {num_steps} steps (eta={eta})...")
+    
+    # Create a sequence of timesteps to invert through
+    # We go forward from 0 to T (opposite of sampling)
+    step_size = max(1, self.noise_steps // num_steps)
+    timesteps = list(range(0, self.noise_steps, step_size))
+    # Ensure we include the final timestep (T) and 0
+    if timesteps[-1] != self.noise_steps - 1:
+        timesteps.append(self.noise_steps - 1)
+    if timesteps[0] != 0:
+        timesteps.insert(0, 0)
+    # Remove duplicates and sort
+    timesteps = sorted(list(set(timesteps)))
+    
+    intermediates = [x0] if return_intermediates else None
+    
+    with torch.no_grad():
+        x = x0.clone()
         
-        Args:
-            model: DDPM UNet model (same network trained for DDPM)
-            x0: Input image(s) to invert. Can be:
-                - Tensor of shape (n, 3, H, W) in range [-1, 1] (normalized)
-                - Tensor of shape (n, 3, H, W) in range [0, 255] (uint8)
-                - If uint8, will be automatically converted to [-1, 1]
-            num_steps: Number of inversion steps (default: 50, should match sampling steps)
-            eta: Controls stochasticity. eta=0.0 is fully deterministic DDIM, 
-                 eta=1.0 recovers DDPM forward process. Default: 0.0 (deterministic)
-            return_intermediates: If True, returns list of all intermediate x_t values
-        
-        Returns:
-            If return_intermediates=False:
-                x_T: Inverted noise tensor (n, 3, H, W) in range [-1, 1]
-            If return_intermediates=True:
-                (x_T, intermediates): Tuple of final noise and list of all x_t values
-        """
-        model.eval()
-        
-        # Convert input to [-1, 1] range if needed
-        if x0.dtype == torch.uint8:
-            x0 = x0.float() / 255.0  # [0, 1]
-            x0 = x0 * 2.0 - 1.0  # [-1, 1]
-        elif x0.max() > 1.0:
-            # Assume [0, 255] range
-            x0 = x0 / 255.0
-            x0 = x0 * 2.0 - 1.0
-        
-        x0 = x0.to(self.device)
-        n = x0.shape[0]
-        
-        logging.info(f"DDIM Inverting {n} image(s) with {num_steps} steps (eta={eta})...")
-        
-        # Create a sequence of timesteps to invert through
-        # We go forward from 0 to T (opposite of sampling)
-        step_size = max(1, self.noise_steps // num_steps)
-        timesteps = list(range(0, self.noise_steps, step_size))
-        # Ensure we include the final timestep (T) and 0
-        if timesteps[-1] != self.noise_steps - 1:
-            timesteps.append(self.noise_steps - 1)
-        if timesteps[0] != 0:
-            timesteps.insert(0, 0)
-        # Remove duplicates and sort
-        timesteps = sorted(list(set(timesteps)))
-        
-        intermediates = [x0] if return_intermediates else None
-        
-        with torch.no_grad():
-            x = x0.clone()
+        # Forward through the selected timesteps (from 0 to T)
+        for i in tqdm(range(len(timesteps) - 1), position=0, desc="DDIM Inversion"):
+            t_curr = timesteps[i]  # Current timestep (smaller, e.g., 0, step_size, ...)
+            t_next = timesteps[i + 1]  # Next timestep (larger, or T)
             
-            # Forward through the selected timesteps (from 0 to T)
-            for i in tqdm(range(len(timesteps) - 1), position=0, desc="DDIM Inversion"):
-                t_curr = timesteps[i]  # Current timestep (smaller, e.g., 0, step_size, ...)
-                t_next = timesteps[i + 1]  # Next timestep (larger, or T)
-                
-                # Create timestep tensor
-                t = (torch.ones(n) * t_curr).long().to(self.device)
-                
-                # Predict noise at current timestep
-                predicted_noise = model(x, t)
-                
-                # Get alpha_hat values
-                alpha_hat_curr = self.alpha_hat[t_curr]
-                alpha_hat_next = self.alpha_hat[t_next]
-                
-                # Predict x_0 from current x_t
-                # x_0 = (x_t - sqrt(1 - alpha_hat_t) * epsilon) / sqrt(alpha_hat_t)
-                pred_x0 = (x - torch.sqrt(1.0 - alpha_hat_curr)[:, None, None, None] * predicted_noise) / \
-                          torch.sqrt(alpha_hat_curr)[:, None, None, None]
-                
-                # Direction pointing to x_{t+1}
-                dir_xt_next = torch.sqrt(1.0 - alpha_hat_next)[:, None, None, None] * predicted_noise
-                
-                # Add stochastic noise if eta > 0
-                # Variance term for DDIM inversion: sigma_t^2 = eta^2 * (1 - alpha_hat_{t+1}) / (1 - alpha_hat_t) * (1 - alpha_t)
-                if eta > 0 and t_next < self.noise_steps - 1:
-                    alpha_curr = self.alpha[t_curr]
-                    # Avoid division by zero
-                    denominator = (1.0 - alpha_hat_curr).clamp(min=1e-8)
-                    sigma_t_sq = eta ** 2 * (1.0 - alpha_hat_next) / denominator * (1.0 - alpha_curr)
-                    sigma_t_sq = sigma_t_sq.clamp(min=0.0)  # Ensure non-negative
-                    noise = torch.randn_like(x) * torch.sqrt(sigma_t_sq)[:, None, None, None]
-                else:
-                    noise = torch.zeros_like(x)
-                
-                # DDIM inversion update: x_{t+1} = sqrt(alpha_hat_{t+1}) * pred_x0 + sqrt(1 - alpha_hat_{t+1}) * predicted_noise + noise
-                x = torch.sqrt(alpha_hat_next)[:, None, None, None] * pred_x0 + dir_xt_next + noise
-                
-                if return_intermediates:
-                    intermediates.append(x.clone())
-        
-        model.train()
-        
-        if return_intermediates:
-            return x, intermediates
-        else:
-            return x
+            # Create timestep tensor
+            t = (torch.ones(n) * t_curr).long().to(self.device)
+            
+            # Predict noise at current timestep
+            predicted_noise = model(x, t)
+            
+            # Get alpha_hat values - use tensor t to get shape (n,) instead of scalar
+            alpha_hat_curr = self.alpha_hat[t]  # Shape: (n,)
+            t_next_tensor = (torch.ones(n) * t_next).long().to(self.device)
+            alpha_hat_next = self.alpha_hat[t_next_tensor]  # Shape: (n,)
+            
+            # Predict x_0 from current x_t
+            # x_0 = (x_t - sqrt(1 - alpha_hat_t) * epsilon) / sqrt(alpha_hat_t)
+            pred_x0 = (x - torch.sqrt(1.0 - alpha_hat_curr)[:, None, None, None] * predicted_noise) / \
+                      torch.sqrt(alpha_hat_curr)[:, None, None, None]
+            
+            # Direction pointing to x_{t+1}
+            dir_xt_next = torch.sqrt(1.0 - alpha_hat_next)[:, None, None, None] * predicted_noise
+            
+            # Add stochastic noise if eta > 0
+            # Variance term for DDIM inversion: sigma_t^2 = eta^2 * (1 - alpha_hat_{t+1}) / (1 - alpha_hat_t) * (1 - alpha_t)
+            if eta > 0 and t_next < self.noise_steps - 1:
+                alpha_curr = self.alpha[t]  # Shape: (n,)
+                # Avoid division by zero
+                denominator = (1.0 - alpha_hat_curr).clamp(min=1e-8)
+                sigma_t_sq = eta ** 2 * (1.0 - alpha_hat_next) / denominator * (1.0 - alpha_curr)
+                sigma_t_sq = sigma_t_sq.clamp(min=0.0)  # Ensure non-negative
+                noise = torch.randn_like(x) * torch.sqrt(sigma_t_sq)[:, None, None, None]
+            else:
+                noise = torch.zeros_like(x)
+            
+            # DDIM inversion update: x_{t+1} = sqrt(alpha_hat_{t+1}) * pred_x0 + sqrt(1 - alpha_hat_{t+1}) * predicted_noise + noise
+            x = torch.sqrt(alpha_hat_next)[:, None, None, None] * pred_x0 + dir_xt_next + noise
+            
+            if return_intermediates:
+                intermediates.append(x.clone())
+    
+    model.train()
+    
+    if return_intermediates:
+        return x, intermediates
+    else:
+        return x
         
 
 def train(args):
