@@ -361,6 +361,105 @@ class Diffusion:
             return x, intermediates
         else:
             return x
+    
+    def interpolate_ddim_improved(self, model, img1, img2, num_interpolations=10, num_steps=200, eta=0.0):
+        """
+        Better interpolation: interpolate in the predicted x_0 space at an intermediate timestep.
+        This gives much cleaner results.
+        """
+        import numpy as np
+        
+        device = self.device
+        model.eval()
+        
+        # Convert images to [-1, 1] range if needed
+        if img1.dtype == torch.uint8 or img1.max() > 1.0:
+            img1 = img1.float() / 255.0 * 2.0 - 1.0
+        if img2.dtype == torch.uint8 or img2.max() > 1.0:
+            img2 = img2.float() / 255.0 * 2.0 - 1.0
+        
+        img1 = img1.to(device)
+        img2 = img2.to(device)
+        
+        print(f"Inverting images to noise space...")
+        x_T1 = self.invert_ddim(model, img1, num_steps=num_steps, eta=eta)
+        x_T2 = self.invert_ddim(model, img2, num_steps=num_steps, eta=eta)
+        
+        # Choose an intermediate timestep (e.g., 200-400 works well)
+        interp_t = 300
+        
+        print(f"Interpolating in x_0 prediction space at timestep {interp_t}...")
+        
+        with torch.no_grad():
+            # Partially denoise both to interp_t
+            x1 = x_T1.clone()
+            x2 = x_T2.clone()
+            
+            # Denoise from T to interp_t
+            for i in range(interp_t, self.noise_steps - 1):
+                t = (torch.ones(1) * i).long().to(device)
+                
+                # For x1
+                pred_noise1 = model(x1, t)
+                alpha_hat_curr = self.alpha_hat[t]
+                alpha_hat_next = self.alpha_hat[t + 1]
+                pred_x0_1 = (x1 - torch.sqrt(1.0 - alpha_hat_curr)[:, None, None, None] * pred_noise1) / \
+                        torch.sqrt(alpha_hat_curr)[:, None, None, None]
+                dir_xt1 = torch.sqrt(1.0 - alpha_hat_next)[:, None, None, None] * pred_noise1
+                x1 = torch.sqrt(alpha_hat_next)[:, None, None, None] * pred_x0_1 + dir_xt1
+                
+                # For x2
+                pred_noise2 = model(x2, t)
+                pred_x0_2 = (x2 - torch.sqrt(1.0 - alpha_hat_curr)[:, None, None, None] * pred_noise2) / \
+                        torch.sqrt(alpha_hat_curr)[:, None, None, None]
+                dir_xt2 = torch.sqrt(1.0 - alpha_hat_next)[:, None, None, None] * pred_noise2
+                x2 = torch.sqrt(alpha_hat_next)[:, None, None, None] * pred_x0_2 + dir_xt2
+            
+            # At timestep interp_t, predict x_0 for both
+            t_interp = (torch.ones(1) * interp_t).long().to(device)
+            pred_noise1 = model(x1, t_interp)
+            pred_noise2 = model(x2, t_interp)
+            alpha_hat_interp = self.alpha_hat[t_interp]
+            
+            pred_x0_1 = (x1 - torch.sqrt(1.0 - alpha_hat_interp)[:, None, None, None] * pred_noise1) / \
+                    torch.sqrt(alpha_hat_interp)[:, None, None, None]
+            pred_x0_2 = (x2 - torch.sqrt(1.0 - alpha_hat_interp)[:, None, None, None] * pred_noise2) / \
+                    torch.sqrt(alpha_hat_interp)[:, None, None, None]
+            
+            # Interpolate in x_0 space (this is the key improvement!)
+            interpolated_images = []
+            for alpha in np.linspace(0, 1, num_interpolations + 2):
+                # Linear interpolation in x_0 space
+                pred_x0_interp = (1 - alpha) * pred_x0_1 + alpha * pred_x0_2
+                
+                # Reconstruct x_t from interpolated x_0
+                x_interp = torch.sqrt(alpha_hat_interp)[:, None, None, None] * pred_x0_interp + \
+                        torch.sqrt(1.0 - alpha_hat_interp)[:, None, None, None] * \
+                        ((1 - alpha) * pred_noise1 + alpha * pred_noise2)
+                
+                # Now denoise from interp_t to 0
+                x = x_interp.clone()
+                for i in reversed(range(interp_t)):
+                    t = (torch.ones(1) * i).long().to(device)
+                    predicted_noise = model(x, t)
+                    alpha_hat_curr = self.alpha_hat[t]
+                    if i > 0:
+                        alpha_hat_next = self.alpha_hat[t - 1]
+                    else:
+                        alpha_hat_next = self.alpha_hat[0]
+                    
+                    pred_x0 = (x - torch.sqrt(1.0 - alpha_hat_curr)[:, None, None, None] * predicted_noise) / \
+                            torch.sqrt(alpha_hat_curr)[:, None, None, None]
+                    dir_xt = torch.sqrt(1.0 - alpha_hat_next)[:, None, None, None] * predicted_noise
+                    x = torch.sqrt(alpha_hat_next)[:, None, None, None] * pred_x0 + dir_xt
+                
+                # Convert to [0, 255] uint8
+                x = (x.clamp(-1, 1) + 1) / 2
+                x = (x * 255).type(torch.uint8)
+                interpolated_images.append(x)
+        
+        model.train()
+        return interpolated_images
         
 
 def train(args):
