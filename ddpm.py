@@ -362,10 +362,14 @@ class Diffusion:
         else:
             return x
     
-    def interpolate_ddim_improved(self, model, img1, img2, num_interpolations=10, num_steps=200, eta=0.0):
+    def interpolate_ddim_improved(self, model, img1, img2, num_interpolations=10, num_steps=200, eta=0.0, interp_timestep=None):
         """
         Better interpolation: interpolate in the predicted x_0 space at an intermediate timestep.
         This gives much cleaner results.
+        
+        Args:
+            interp_timestep: Timestep at which to interpolate. Lower = less noisy (default: 100)
+                            Recommended: 50-150 for cleaner results
         """
         import numpy as np
         
@@ -401,8 +405,11 @@ class Diffusion:
         
         batch_size = x_T1.shape[0]  # Get actual batch size from inverted tensors
         
-        # Choose an intermediate timestep (e.g., 200-400 works well)
-        interp_t = 300
+        # Choose an intermediate timestep - LOWER is better for cleaner results
+        if interp_timestep is None:
+            interp_t = 150  # Much lower than 300 for cleaner interpolation
+        else:
+            interp_t = interp_timestep
         
         print(f"Interpolating in x_0 prediction space at timestep {interp_t}...")
         
@@ -411,21 +418,35 @@ class Diffusion:
             x1 = x_T1.clone()
             x2 = x_T2.clone()
             
-            # Denoise from T to interp_t
-            for i in range(interp_t, self.noise_steps - 1):
-                # Use actual batch size
-                t = (torch.ones(batch_size) * i).long().to(device)
+            # Denoise from T to interp_t using DDIM steps
+            # Use the same step schedule as DDIM sampling
+            step_size = max(1, self.noise_steps // num_steps)
+            timesteps = list(range(0, self.noise_steps, step_size))
+            if timesteps[-1] != self.noise_steps - 1:
+                timesteps.append(self.noise_steps - 1)
+            if timesteps[0] != 0:
+                timesteps.insert(0, 0)
+            timesteps = sorted(list(set(timesteps)))
+            
+            # Find timesteps from T down to interp_t
+            relevant_timesteps = [t for t in timesteps if t >= interp_t]
+            relevant_timesteps = sorted(relevant_timesteps, reverse=True)
+            
+            # Denoise both images to interp_t
+            for idx in range(len(relevant_timesteps) - 1):
+                t_curr = relevant_timesteps[idx]
+                t_next = relevant_timesteps[idx + 1]
+                
+                if t_next < interp_t:
+                    break
+                
+                t = (torch.ones(batch_size) * t_curr).long().to(device)
                 
                 # For x1
                 pred_noise1 = model(x1, t)
-                alpha_hat_curr = self.alpha_hat[t]  # Shape: (batch_size,)
-                alpha_hat_next = self.alpha_hat[t + 1] if (t + 1).max() < self.noise_steps else self.alpha_hat[t]
-                # Handle case where t+1 might exceed bounds
-                if (t + 1).max() >= self.noise_steps:
-                    t_next = torch.clamp(t + 1, max=self.noise_steps - 1)
-                    alpha_hat_next = self.alpha_hat[t_next]
-                else:
-                    alpha_hat_next = self.alpha_hat[t + 1]
+                alpha_hat_curr = self.alpha_hat[t]
+                t_next_tensor = (torch.ones(batch_size) * t_next).long().to(device)
+                alpha_hat_next = self.alpha_hat[t_next_tensor]
                 
                 pred_x0_1 = (x1 - torch.sqrt(1.0 - alpha_hat_curr)[:, None, None, None] * pred_noise1) / \
                         torch.sqrt(alpha_hat_curr)[:, None, None, None]
@@ -456,21 +477,30 @@ class Diffusion:
                 # Linear interpolation in x_0 space
                 pred_x0_interp = (1 - alpha) * pred_x0_1 + alpha * pred_x0_2
                 
+                # Also interpolate noise for smoother transition
+                pred_noise_interp = (1 - alpha) * pred_noise1 + alpha * pred_noise2
+                
                 # Reconstruct x_t from interpolated x_0
                 x_interp = torch.sqrt(alpha_hat_interp)[:, None, None, None] * pred_x0_interp + \
-                        torch.sqrt(1.0 - alpha_hat_interp)[:, None, None, None] * \
-                        ((1 - alpha) * pred_noise1 + alpha * pred_noise2)
+                        torch.sqrt(1.0 - alpha_hat_interp)[:, None, None, None] * pred_noise_interp
                 
-                # Now denoise from interp_t to 0
+                # Now denoise from interp_t to 0 using DDIM
                 x = x_interp.clone()
-                for i in reversed(range(interp_t)):
-                    t = (torch.ones(batch_size) * i).long().to(device)
+                
+                # Use DDIM step schedule for denoising
+                denoise_timesteps = [t for t in timesteps if t <= interp_t]
+                denoise_timesteps = sorted(denoise_timesteps, reverse=True)
+                
+                for idx in range(len(denoise_timesteps) - 1):
+                    t_curr = denoise_timesteps[idx]
+                    t_next = denoise_timesteps[idx + 1]
+                    
+                    t = (torch.ones(batch_size) * t_curr).long().to(device)
                     predicted_noise = model(x, t)
                     alpha_hat_curr = self.alpha_hat[t]
-                    if i > 0:
-                        alpha_hat_next = self.alpha_hat[t - 1]
-                    else:
-                        alpha_hat_next = self.alpha_hat[0]
+                    
+                    t_next_tensor = (torch.ones(batch_size) * t_next).long().to(device)
+                    alpha_hat_next = self.alpha_hat[t_next_tensor]
                     
                     pred_x0 = (x - torch.sqrt(1.0 - alpha_hat_curr)[:, None, None, None] * predicted_noise) / \
                             torch.sqrt(alpha_hat_curr)[:, None, None, None]
