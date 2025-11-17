@@ -372,6 +372,12 @@ class Diffusion:
         device = self.device
         model.eval()
         
+        # Ensure images have batch dimension
+        if img1.dim() == 3:
+            img1 = img1.unsqueeze(0)
+        if img2.dim() == 3:
+            img2 = img2.unsqueeze(0)
+        
         # Convert images to [-1, 1] range if needed
         if img1.dtype == torch.uint8 or img1.max() > 1.0:
             img1 = img1.float() / 255.0 * 2.0 - 1.0
@@ -381,9 +387,19 @@ class Diffusion:
         img1 = img1.to(device)
         img2 = img2.to(device)
         
+        batch_size = img1.shape[0]
+        
         print(f"Inverting images to noise space...")
         x_T1 = self.invert_ddim(model, img1, num_steps=num_steps, eta=eta)
         x_T2 = self.invert_ddim(model, img2, num_steps=num_steps, eta=eta)
+        
+        # Ensure batch dimension is preserved
+        if x_T1.dim() == 3:
+            x_T1 = x_T1.unsqueeze(0)
+        if x_T2.dim() == 3:
+            x_T2 = x_T2.unsqueeze(0)
+        
+        batch_size = x_T1.shape[0]  # Get actual batch size from inverted tensors
         
         # Choose an intermediate timestep (e.g., 200-400 works well)
         interp_t = 300
@@ -397,12 +413,20 @@ class Diffusion:
             
             # Denoise from T to interp_t
             for i in range(interp_t, self.noise_steps - 1):
-                t = (torch.ones(1) * i).long().to(device)
+                # Use actual batch size
+                t = (torch.ones(batch_size) * i).long().to(device)
                 
                 # For x1
                 pred_noise1 = model(x1, t)
-                alpha_hat_curr = self.alpha_hat[t]
-                alpha_hat_next = self.alpha_hat[t + 1]
+                alpha_hat_curr = self.alpha_hat[t]  # Shape: (batch_size,)
+                alpha_hat_next = self.alpha_hat[t + 1] if (t + 1).max() < self.noise_steps else self.alpha_hat[t]
+                # Handle case where t+1 might exceed bounds
+                if (t + 1).max() >= self.noise_steps:
+                    t_next = torch.clamp(t + 1, max=self.noise_steps - 1)
+                    alpha_hat_next = self.alpha_hat[t_next]
+                else:
+                    alpha_hat_next = self.alpha_hat[t + 1]
+                
                 pred_x0_1 = (x1 - torch.sqrt(1.0 - alpha_hat_curr)[:, None, None, None] * pred_noise1) / \
                         torch.sqrt(alpha_hat_curr)[:, None, None, None]
                 dir_xt1 = torch.sqrt(1.0 - alpha_hat_next)[:, None, None, None] * pred_noise1
@@ -416,7 +440,7 @@ class Diffusion:
                 x2 = torch.sqrt(alpha_hat_next)[:, None, None, None] * pred_x0_2 + dir_xt2
             
             # At timestep interp_t, predict x_0 for both
-            t_interp = (torch.ones(1) * interp_t).long().to(device)
+            t_interp = (torch.ones(batch_size) * interp_t).long().to(device)
             pred_noise1 = model(x1, t_interp)
             pred_noise2 = model(x2, t_interp)
             alpha_hat_interp = self.alpha_hat[t_interp]
@@ -440,7 +464,7 @@ class Diffusion:
                 # Now denoise from interp_t to 0
                 x = x_interp.clone()
                 for i in reversed(range(interp_t)):
-                    t = (torch.ones(1) * i).long().to(device)
+                    t = (torch.ones(batch_size) * i).long().to(device)
                     predicted_noise = model(x, t)
                     alpha_hat_curr = self.alpha_hat[t]
                     if i > 0:
